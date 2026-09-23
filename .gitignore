@@ -1,0 +1,4 @@
+tests
+*.dot
+*.svg
+*.txt
