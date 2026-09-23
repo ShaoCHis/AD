@@ -1,7 +1,6 @@
 #pragma once
 
 #include "autodiff/autodiff.h"
-#include "autodiff/json.h"
 
 #include <map>
 #include <memory>
@@ -19,8 +18,8 @@ private:
     std::map<std::string, std::shared_ptr<const CustomOp>> ops_;
 };
 
-// Loads compiled C++ operators before the JSON graph is parsed. Keep this
-// object alive longer than the registry, graph and evaluators using its ops.
+// Load compiled operators before parsing assignments. This manager must
+// outlive every operator instance, graph and evaluator using the plugin.
 class PluginManager {
 public:
     PluginManager() = default;
@@ -32,48 +31,45 @@ private:
     std::vector<void*> handles_;
 };
 
-// A compiled plugin exports: extern "C" void register_autodiff_ops(
-//     autodiff::CustomOpRegistry&);
+// Plugins export: extern "C" void register_autodiff_ops(CustomOpRegistry&).
 
-struct NamedExpression {
-    std::string id;
-    Expr expr;
-};
-struct DerivativeRequest {
-    std::string id, source_name, wrt_name;
-    Expr source, wrt, result;
-};
-
-class LoadedModel {
+// Assignments such as `h=x+y` are parsed first and then resolved as a DAG.
+// The symbols map retains every named intermediate expression and variable.
+class ExpressionProgram {
 public:
-    LoadedModel(Json document, const CustomOpRegistry& ops, bool explain_derivatives);
-    LoadedModel(const LoadedModel&) = delete;
-    LoadedModel& operator=(const LoadedModel&) = delete;
+    ExpressionProgram(const std::string& source, const CustomOpRegistry& ops);
+    ExpressionProgram(const ExpressionProgram&) = delete;
+    ExpressionProgram& operator=(const ExpressionProgram&) = delete;
+
     Graph& graph() { return graph_; }
     const Graph& graph() const { return graph_; }
-    const NamedExpression& target() const { return target_; }
-    const std::vector<NamedExpression>& outputs() const { return outputs_; }
-    const std::vector<DerivativeRequest>& derivatives() const { return derivatives_; }
-    const std::map<std::string, double>& input_values() const { return input_values_; }
-    Inputs make_inputs(const Evaluator& evaluator) const;
+    Expr at(const std::string& name) const;
+    const std::map<std::string, Expr>& symbols() const { return symbols_; }
+    bool is_variable(const std::string& name) const { return variables_.count(name) != 0; }
+    Inputs make_inputs(const Evaluator& evaluator,
+                       const std::map<std::string, double>& values) const;
 private:
-    Json document_;
+    struct SyntaxNode;
+    typedef std::shared_ptr<SyntaxNode> Syntax;
+    struct SyntaxNode {
+        enum Kind { Literal, Name, UnaryMinus, Add, Sub, Mul, Div, Call } kind;
+        double literal = 0;
+        std::string name;
+        std::vector<Syntax> args;
+        explicit SyntaxNode(Kind k) : kind(k) {}
+    };
+    class ExpressionParser;
     const CustomOpRegistry& ops_;
     Graph graph_;
-    std::map<std::string, Expr> values_;
-    std::set<std::string> variable_names_;
-    std::map<std::string, const Json*> definitions_, derivative_specs_;
+    std::map<std::string, Syntax> definitions_;
+    std::map<std::string, Expr> symbols_;
+    std::set<std::string> variables_;
     std::map<std::string, int> states_;
-    std::map<std::string, double> input_values_;
-    NamedExpression target_;
-    std::vector<NamedExpression> outputs_;
-    std::vector<DerivativeRequest> derivatives_;
 
-    void reserve_name(const std::string& id);
-    Expr resolve(const std::string& id, int depth = 0);
-    Expr resolve_derivative(const std::string& id, int depth);
-    Expr parse_expression(const Json& item, int depth);
-    static std::string field(const Json& item, const std::string& key);
+    Expr resolve(const std::string& name, int depth);
+    Expr build(const Syntax& node, int depth);
 };
+
+std::string read_expression_file(const std::string& path);
 
 } // namespace autodiff

@@ -104,6 +104,8 @@ class CustomOp {
 public:
     virtual ~CustomOp() = default;
     virtual const char* name() const = 0;
+    // Explicit arity lets the parser reject func_a(x) before evaluation.
+    virtual std::size_t arity() const = 0;
     virtual double forward(Span<const double> inputs) const = 0;
     // 把梯度贡献累加到 input_grads；调用方会先清零这个数组。
     virtual void backward(Span<const double> inputs, double output,
@@ -210,16 +212,35 @@ private:
     std::vector<double> custom_grads_;
 };
 
+// A value query needs only output. A derivative query means d(root)/d(output).
+// Both names are graph nodes, so an intermediate expression can be either one.
+struct EvaluationQuery {
+    enum Kind { Value, Derivative } kind;
+    Expr root, output;
+    static EvaluationQuery value(Expr output) {
+        EvaluationQuery q = {Value, Expr(), output};
+        return q;
+    }
+    static EvaluationQuery derivative(Expr root, Expr output) {
+        EvaluationQuery q = {Derivative, root, output};
+        return q;
+    }
+};
+
 // 编译时仅收集输出可达的节点，并将多个输出合并到同一执行计划。
 // 图增加新输出后，为新输出重新构造 Evaluator。
 class Evaluator {
 public:
     explicit Evaluator(std::initializer_list<Expr> roots);
     explicit Evaluator(Span<const Expr> roots);
+    explicit Evaluator(std::initializer_list<EvaluationQuery> queries);
+    explicit Evaluator(Span<const EvaluationQuery> queries);
     Inputs create_inputs() const;
     Workspace create_workspace() const;
     std::size_t output_count() const noexcept { return roots_.size(); }
     std::size_t instruction_count() const noexcept { return instructions_.size(); }
+    Expr result_expression(std::size_t index) const;
+    bool uses_variable(Expr variable) const;
 
     // 预先准备 inputs/outputs/workspace 后，框架的执行过程不再分配堆内存；
     // 每个可达节点仅执行一次，中间结果存入 Workspace。
@@ -244,10 +265,12 @@ private:
     std::vector<Instruction> instructions_;
     std::vector<std::int32_t> index_by_node_;
     std::vector<std::int32_t> roots_;
+    std::vector<Expr> result_expressions_;
     std::vector<std::string> variable_names_;
     std::unordered_map<std::string, std::int32_t> variable_by_name_;
     std::size_t max_custom_arity_ = 0;
     void check(const Inputs& inputs, const Workspace& ws) const;
+    void compile(Span<const Expr> roots);
     void run(const Inputs& inputs, Workspace& ws) const;
 };
 

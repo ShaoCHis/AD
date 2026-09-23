@@ -2,3 +2,6 @@ tests
 *.dot
 *.svg
 *.txt
+build
+Testing
+custom_dot

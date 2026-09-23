@@ -10,6 +10,7 @@ using namespace autodiff;
 class CubePlus2X final : public CustomOp {
 public:
     const char* name() const override { return "CubePlus2X"; }
+    std::size_t arity() const override { return 1; }
     // 前向定义 f(x) = x³ + 2x。
     double forward(Span<const double> in) const override {
         double x = in[0];

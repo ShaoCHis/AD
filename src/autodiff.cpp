@@ -5,6 +5,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -88,7 +89,10 @@ std::vector<Expr> Expr::derivative(Span<const Expr> wrts) const {
 }
 Expr Expr::named(std::string name) const {
     graph().validate(*this);
-    graph().nodes_[id_].name = std::move(name);
+    // A named alias may simplify to an existing input variable (h = x + 0).
+    // Its original name is the lookup key used by compiled Inputs.
+    Node& node = graph().nodes_[id_];
+    if (node.op != Op::Variable) node.name = std::move(name);
     return *this;
 }
 std::string Expr::explain() const {
@@ -220,7 +224,8 @@ Expr Graph::binary(Op op, Expr x, Expr y) {
 }
 Expr Graph::sign(Expr x) { return unary(Op::Sign, x); }
 Expr Graph::custom(std::shared_ptr<const CustomOp> op, Span<const Expr> inputs) {
-    if (!op || inputs.empty()) fail("custom operator and its inputs are required");
+    if (!op) fail("custom operator is required");
+    if (inputs.size() != op->arity()) fail("custom operator input count does not match its arity");
     std::vector<NodeId> ids;
     ids.reserve(inputs.size());
     for (Expr x : inputs) { validate(x); ids.push_back(x.id()); }
@@ -431,10 +436,50 @@ void Inputs::set(Expr variable, double value) {
 
 Evaluator::Evaluator(std::initializer_list<Expr> roots)
     : Evaluator(Span<const Expr>(roots.begin(), roots.size())) {}
-Evaluator::Evaluator(Span<const Expr> roots) {
+Evaluator::Evaluator(Span<const Expr> roots) { compile(roots); }
+Evaluator::Evaluator(std::initializer_list<EvaluationQuery> queries)
+    : Evaluator(Span<const EvaluationQuery>(queries.begin(), queries.size())) {}
+Evaluator::Evaluator(Span<const EvaluationQuery> queries) {
+    if (queries.empty()) fail("evaluator requires at least one query");
+    Graph* graph = nullptr;
+    std::vector<Expr> results(queries.size());
+    std::map<NodeId, std::vector<std::size_t>> by_root;
+    for (std::size_t i = 0; i < queries.size(); ++i) {
+        const EvaluationQuery& q = queries[i];
+        Graph& current = q.output.graph();
+        if (!graph) graph = &current;
+        if (graph != &current) fail("query nodes must belong to one graph");
+        if (q.kind == EvaluationQuery::Value) results[i] = q.output;
+        else if (q.kind == EvaluationQuery::Derivative) {
+            if (&q.root.graph() != graph) fail("root and output must belong to one graph");
+            by_root[q.root.id()].push_back(i);
+        } else fail("invalid query kind");
+    }
+    // All d(root)/d(output_i) for the same root share one symbolic reverse pass.
+    for (const auto& group : by_root) {
+        std::vector<Expr> wrts;
+        for (std::size_t index : group.second) wrts.push_back(queries[index].output);
+        std::vector<Expr> derivatives = queries[group.second.front()].root.derivative(wrts);
+        for (std::size_t i = 0; i < group.second.size(); ++i)
+            results[group.second[i]] = derivatives[i];
+    }
+    compile(results);
+}
+Expr Evaluator::result_expression(std::size_t index) const {
+    if (index >= result_expressions_.size()) fail("query index out of range");
+    return result_expressions_[index];
+}
+bool Evaluator::uses_variable(Expr variable) const {
+    if (&variable.graph() != graph_ || variable.id() >= index_by_node_.size())
+        fail("variable belongs to another graph");
+    return index_by_node_[variable.id()] >= 0 &&
+           instructions_[index_by_node_[variable.id()]].node.op == Op::Variable;
+}
+void Evaluator::compile(Span<const Expr> roots) {
     if (roots.empty()) fail("evaluator requires at least one output");
     graph_ = &roots[0].graph();
     for (Expr root : roots) graph_->validate(root);
+    result_expressions_.assign(roots.begin(), roots.end());
     index_by_node_.assign(graph_->nodes_.size(), -1);
     std::vector<std::uint8_t> reachable(graph_->nodes_.size());
     std::vector<NodeId> stack;

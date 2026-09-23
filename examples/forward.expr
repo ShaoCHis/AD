@@ -1,0 +1,4 @@
+# Definitions may refer forward to a later line.
+t = h - z + func_a(x,y)
+z = 2*x + exp(x)
+h = x + y
