@@ -1,0 +1,29 @@
+{
+  "variables": ["p", "x", "y"],
+  "definitions": [
+    {
+      "id": "loss",
+      "role": "target",
+      "op": "square",
+      "inputs": [
+        {"op": "sub", "inputs": ["pred", "y"]}
+      ]
+    },
+    {
+      "id": "pred",
+      "role": "intermediate",
+      "op": "add",
+      "inputs": [
+        {"op": "exp", "inputs": [{"op": "mul", "inputs": ["x", "p"]}]},
+        {"op": "mul", "inputs": [0.5, "x"]}
+      ]
+    }
+  ],
+  "derivatives": [
+    {"id": "grad_p", "of": "loss", "wrt": "p"},
+    {"id": "grad_pred", "of": "loss", "wrt": "pred"},
+    {"id": "grad2_p", "of": "grad_p", "wrt": "p"}
+  ],
+  "inputs": {"p": 0.5, "x": 1.0, "y": -0.05},
+  "outputs": ["loss", "grad_p", "grad_pred", "grad2_p"]
+}

@@ -139,6 +139,11 @@ public:
     Expr custom(std::shared_ptr<const CustomOp> op, std::initializer_list<Expr> inputs);
     std::vector<Expr> derivatives(Expr output, Span<const Expr> wrts);
     void dump_dot(Expr root, std::ostream& out) const;
+    // Enable before derivative() to retain the propagation rules for DOT.
+    void enable_derivative_explanations(bool enabled) { record_derivations_ = enabled; }
+    void dump_derivative_dot(Expr source, Expr wrt, Expr derivative, std::ostream& out,
+                             const std::string& source_label = "",
+                             const std::string& wrt_label = "") const;
     std::size_t node_count() const noexcept { return nodes_.size(); }
 
 private:
@@ -170,6 +175,17 @@ private:
     };
     std::unordered_map<Key, NodeId, KeyHash> interned_;
     std::unordered_map<std::string, NodeId> variables_;
+    struct DerivationStep {
+        NodeId node, upstream, input, contribution;
+        std::string rule;
+    };
+    struct DerivationPass {
+        NodeId source, wrt, result;
+        std::size_t original_size;
+        std::shared_ptr<const std::vector<DerivationStep>> steps;
+    };
+    bool record_derivations_ = false;
+    std::vector<DerivationPass> derivations_;
 };
 
 class Inputs {

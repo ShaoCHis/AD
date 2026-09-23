@@ -253,7 +253,13 @@ std::vector<Expr> Graph::derivatives(Expr output, Span<const Expr> wrts) {
     // 所以可以把梯度图再次传给 derivative() 求高阶导。
     std::vector<Expr> adj(initial_size);
     adj[output.id_] = constant(1);
-    auto add = [&](NodeId id, Expr contribution) {
+    std::vector<DerivationStep> steps;
+    NodeId current_source = output.id_;
+    NodeId current_upstream = adj[output.id_].id_;
+    auto add = [&](NodeId id, Expr contribution, const char* rule) {
+        if (record_derivations_)
+            steps.push_back(DerivationStep{current_source, current_upstream, id,
+                                           contribution.id_, rule});
         if (adj[id].graph_) adj[id] = adj[id] + contribution;
         else adj[id] = contribution;
     };
@@ -263,17 +269,19 @@ std::vector<Expr> Graph::derivatives(Expr output, Span<const Expr> wrts) {
         // 符号求导会向 nodes_ 追加节点；先复制旧节点，避免 vector 扩容悬空。
         Node n = nodes_[id];
         Expr dz = adj[id], a(this, n.a), b(this, n.b);
+        current_source = id;
+        current_upstream = dz.id_;
         switch (n.op) {
         case Op::Variable: case Op::Constant: case Op::Sign: break;
-        case Op::Add: add(n.a, dz); add(n.b, dz); break;
-        case Op::Sub: add(n.a, dz); add(n.b, -dz); break;
-        case Op::Mul: add(n.a, dz * b); add(n.b, dz * a); break;
+        case Op::Add: add(n.a, dz, "dz * 1"); add(n.b, dz, "dz * 1"); break;
+        case Op::Sub: add(n.a, dz, "dz * 1"); add(n.b, -dz, "dz * -1"); break;
+        case Op::Mul: add(n.a, dz * b, "dz * right"); add(n.b, dz * a, "dz * left"); break;
         // 链式法则：对 a/b 分别传递 dz/b 与 -dz*a/b²。
-        case Op::Div: add(n.a, dz / b); add(n.b, -(dz * a / b.square())); break;
-        case Op::Square: add(n.a, dz * (2.0 * a)); break;
-        case Op::Abs: add(n.a, dz * sign(a)); break;
+        case Op::Div: add(n.a, dz / b, "dz / right"); add(n.b, -(dz * a / b.square()), "-dz * left / right^2"); break;
+        case Op::Square: add(n.a, dz * (2.0 * a), "dz * 2 * input"); break;
+        case Op::Abs: add(n.a, dz * sign(a), "dz * sign(input)"); break;
         // exp 的局部导数就是本节点结果；引用已有节点以复用前向值。
-        case Op::Exp: add(n.a, dz * Expr(this, id)); break;
+        case Op::Exp: add(n.a, dz * Expr(this, id), "dz * exp(input)"); break;
         case Op::Custom: {
             std::vector<Expr> inputs;
             inputs.reserve(n.custom_inputs.size());
@@ -281,7 +289,7 @@ std::vector<Expr> Graph::derivatives(Expr output, Span<const Expr> wrts) {
             for (std::size_t i = 0; i < inputs.size(); ++i) {
                 Expr partial = n.custom->symbolic_partial(*this, inputs, Expr(this, id), i);
                 validate(partial);
-                add(n.custom_inputs[i], dz * partial);
+                add(n.custom_inputs[i], dz * partial, "dz * symbolic_partial(input)");
             }
             break;
         }
@@ -290,6 +298,13 @@ std::vector<Expr> Graph::derivatives(Expr output, Span<const Expr> wrts) {
     std::vector<Expr> results;
     results.reserve(wrts.size());
     for (Expr x : wrts) results.push_back(adj[x.id_].graph_ ? adj[x.id_] : constant(0));
+    if (record_derivations_) {
+        std::shared_ptr<const std::vector<DerivationStep>> saved(
+            new std::vector<DerivationStep>(std::move(steps)));
+        for (std::size_t i = 0; i < wrts.size(); ++i)
+            derivations_.push_back(DerivationPass{output.id_, wrts[i].id_,
+                                                 results[i].id_, initial_size, saved});
+    }
     return results;
 }
 void Graph::dump_dot(Expr root, std::ostream& out) const {
@@ -311,6 +326,81 @@ void Graph::dump_dot(Expr root, std::ostream& out) const {
         if (n.op == Op::Constant) { std::ostringstream s; s << n.literal; label += "\n" + s.str(); }
         out << "  n" << id << " [label=\"" << dot_escape(label) << "\"];\n";
         children(n, [&](NodeId child) { out << "  n" << child << " -> n" << id << ";\n"; });
+    }
+    out << "}\n";
+}
+void Graph::dump_derivative_dot(Expr source, Expr wrt, Expr derivative,
+                                std::ostream& out, const std::string& source_label,
+                                const std::string& wrt_label) const {
+    validate(source); validate(wrt); validate(derivative);
+    const DerivationPass* pass = nullptr;
+    for (std::vector<DerivationPass>::const_reverse_iterator it = derivations_.rbegin();
+         it != derivations_.rend(); ++it) {
+        if (it->source == source.id_ && it->wrt == wrt.id_ && it->result == derivative.id_) {
+            pass = &*it;
+            break;
+        }
+    }
+    if (!pass) fail("derivative explanation was not recorded; enable it before differentiating");
+    // Show only propagation steps whose receiving input still depends on wrt.
+    // This keeps, for example, the unrelated y branch out of d(loss)/d(p).
+    std::vector<std::uint8_t> on_wrt_path(pass->original_size);
+    for (NodeId id = 0; id < pass->original_size; ++id) {
+        if (id == wrt.id_) on_wrt_path[id] = 1;
+        else children(nodes_[id], [&](NodeId child) {
+            if (child < pass->original_size && on_wrt_path[child]) on_wrt_path[id] = 1;
+        });
+    }
+    std::vector<std::uint8_t> marked(nodes_.size());
+    std::vector<NodeId> stack{source.id_, derivative.id_};
+    for (const DerivationStep& step : *pass->steps)
+        if (on_wrt_path[step.input]) stack.push_back(step.contribution);
+    while (!stack.empty()) {
+        NodeId id = stack.back(); stack.pop_back();
+        if (marked[id]) continue;
+        marked[id] = 1;
+        children(nodes_[id], [&](NodeId child) { stack.push_back(child); });
+    }
+    std::string source_name = source_label.empty() ?
+        (nodes_[source.id_].name.empty() ? "n" + std::to_string(source.id_) : nodes_[source.id_].name) : source_label;
+    std::string wrt_name = wrt_label.empty() ?
+        (nodes_[wrt.id_].name.empty() ? "n" + std::to_string(wrt.id_) : nodes_[wrt.id_].name) : wrt_label;
+    out << "digraph derivative {\n  rankdir=LR;\n  node [style=filled];\n";
+    for (NodeId id = 0; id < nodes_.size(); ++id) {
+        if (!marked[id]) continue;
+        const Node& n = nodes_[id];
+        std::string label = "#" + std::to_string(id) + " " +
+            (n.op == Op::Custom ? std::string(n.custom->name()) : op_name(n.op));
+        if (!n.name.empty()) label += "\n" + n.name;
+        if (n.op == Op::Constant) { std::ostringstream s; s << n.literal; label += "\n" + s.str(); }
+        const char* color = id >= pass->original_size ? "#d9eeff" : "#eeeeee";
+        if (id == source.id_) color = "#ffe5ba";
+        if (id == wrt.id_) color = "#dff2cc";
+        if (id == derivative.id_) color = "#dfceff";
+        out << "  n" << id << " [label=\"" << dot_escape(label)
+            << "\", fillcolor=\"" << color << "\"];\n";
+        children(n, [&](NodeId child) { out << "  n" << child << " -> n" << id << ";\n"; });
+    }
+    std::string heading = "d(" + source_name + ")/d(" + wrt_name + ")";
+    out << "  summary [shape=note, fillcolor=\"#f5efff\", label=\""
+        << dot_escape(heading + "\n" + derivative.explain()) << "\"];\n";
+    out << "  n" << source.id_ << " -> summary [style=dashed, color=purple, label=\"differentiate\"];\n";
+    if (marked[wrt.id_])
+        out << "  n" << wrt.id_ << " -> summary [style=dotted, color=green, label=\"with respect to\"];\n";
+    out << "  summary -> n" << derivative.id_ << " [style=dashed, color=purple, label=\"result\"];\n";
+    // Dashed propagation notes describe why each contribution was generated.
+    std::size_t visible_rule = 0;
+    for (std::size_t i = 0; i < pass->steps->size(); ++i) {
+        const DerivationStep& step = (*pass->steps)[i];
+        if (!on_wrt_path[step.input]) continue;
+        const std::string label = "#" + std::to_string(step.node) + " " + op_name(nodes_[step.node].op) +
+            " -> input #" + std::to_string(step.input) + "\n" + step.rule +
+            "\nupstream #" + std::to_string(step.upstream) +
+            "; contribution #" + std::to_string(step.contribution);
+        out << "  rule" << visible_rule << " [shape=note, fillcolor=\"#fff7d6\", label=\""
+            << dot_escape(label) << "\"];\n";
+        out << "  n" << step.node << " -> rule" << visible_rule << " [style=dashed, color=\"#b38423\"];\n";
+        out << "  rule" << visible_rule++ << " -> n" << step.contribution << " [style=dotted, color=\"#b38423\"];\n";
     }
     out << "}\n";
 }

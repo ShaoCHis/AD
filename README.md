@@ -1,17 +1,35 @@
 # Scalar Autodiff (C++11)
 
-一个标量静态求导框架。先用 `Graph` 建立表达式 DAG，再生成导数表达式；`Evaluator` 将多个输出编译为同一份执行计划，适合重复传入不同数据。支持 `+ - * /`、`square()`、整数 `pow()`、`abs()`、`exp()`、自定义算子、一阶和高阶导数，也提供直接数值反向传播。
+一个标量静态求导框架。JSON 命令行程序会先加载 C++ 自定义算子共享库，再从 JSON 建立表达式 DAG、求导并执行。`Evaluator` 把多个输出编译为同一计划，适合重复传入数据。支持 `+ - * /`、`square()`、整数 `pow()`、`abs()`、`exp()`、自定义算子、一阶和高阶导数，也提供直接数值反向传播。原有 C++ 手动建图 API 仍可使用。
 
 ## 构建
 
 ```bash
+# 构建 JSON runner 需要 gflags 的头文件、库与 CMake package config。
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build --output-on-failure
-./build/autodiff_example
+./build/autodiff_runner --graph_json=examples/model.json --emit_dot=true --dot_dir=dot
+./build/autodiff_runner --op_plugins=./build/libexample_custom_ops.so \
+  --graph_json=examples/custom_model.json --emit_dot=true --dot_dir=custom_dot
 ```
 
-没有 CMake 时，可用 C++11 编译器：
+其中 `--emit_dot` 默认是 `false`，不生成任何 DOT 文件；设为 `true` 时才输出目标图和每个导数的解释图。`--dot_dir` 需是已有目录或可直接创建的单层目录。gflags 的 `DEFINE_bool`、`DEFINE_string` 与 `ParseCommandLineFlags` 是该开关的实际实现；gflags 官方说明见 [gflags 使用文档](https://gflags.github.io/gflags/)。
+
+如果没有 CMake，且已经安装 gflags，可以在项目根目录直接用 C++11 编译：
+
+```bash
+g++ -std=c++11 -O2 -fPIC -shared -Iinclude \
+  src/autodiff.cpp src/json.cpp src/model.cpp -ldl -o libscalar_autodiff.so
+g++ -std=c++11 -O2 -fPIC -shared -Iinclude \
+  examples/custom_ops.cpp -L. -lscalar_autodiff \
+  -Wl,-rpath,'$ORIGIN' -o libexample_custom_ops.so
+g++ -std=c++11 -O2 -Iinclude runner/main.cpp -L. \
+  -lscalar_autodiff -lgflags -ldl -Wl,-rpath,'$ORIGIN' -o autodiff_runner
+./autodiff_runner --graph_json=examples/model.json --emit_dot=true
+```
+
+原有示例无需 gflags：
 
 ```bash
 g++ -std=c++11 -O2 -Iinclude src/autodiff.cpp tests/test_autodiff.cpp -o autodiff_tests
@@ -20,7 +38,56 @@ g++ -std=c++11 -O2 -Iinclude src/autodiff.cpp examples/main.cpp -o autodiff_exam
 ./autodiff_example
 ```
 
-代码入口：`include/autodiff/autodiff.h` 定义 API，`src/autodiff.cpp` 实现建图、符号求导和执行；`examples/main.cpp` 展示调用与自定义算子；`tests/test_autodiff.cpp` 验证结果。关键处理处有中文注释。
+代码入口：`include/autodiff/autodiff.h` 与 `src/autodiff.cpp` 是求导内核；`json.h/json.cpp` 严格解析 JSON；`model.h/model.cpp` 注册插件并加载多级表达式；`runner/main.cpp` 使用 gflags；`examples/custom_ops.cpp` 是共享库插件，`examples/model.json` 与 `examples/custom_model.json` 是输入样例。
+
+## JSON 图格式
+
+```json
+{
+  "variables": ["p", "x", "y"],
+  "definitions": [
+    {"id": "loss", "role": "target", "op": "square",
+     "inputs": [{"op": "sub", "inputs": ["pred", "y"]}]},
+    {"id": "pred", "op": "add",
+     "inputs": [
+       {"op": "exp", "inputs": [{"op": "mul", "inputs": ["x", "p"]}]},
+       {"op": "mul", "inputs": [0.5, "x"]}
+     ]}
+  ],
+  "derivatives": [
+    {"id": "grad_p", "of": "loss", "wrt": "p"},
+    {"id": "grad_pred", "of": "loss", "wrt": "pred"},
+    {"id": "grad2_p", "of": "grad_p", "wrt": "p"}
+  ],
+  "inputs": {"p": 0.5, "x": 1, "y": -0.05},
+  "outputs": ["loss", "grad_p", "grad_pred", "grad2_p"]
+}
+```
+
+- `role: "target"` **恰好出现一次**；其他定义是中间表达式（`role: "intermediate"` 可省略）。`loss` 可以写在它引用的 `pred` 前面；加载器按依赖递归建图，并检查循环与未定义引用。
+- `op` 是 `add/sub/mul/div`（恰好两个输入）、`square/abs/exp`（恰好一个输入）或已注册的自定义算子名。`inputs` 元素可为数字、已有变量或表达式 ID、内嵌的 `{ "op": ..., "inputs": [...] }`。
+- `derivatives` 可引用变量、中间表达式，也能在 `of` 中引用前一个导数 ID；相同 `of` 的请求会共用一次符号反向遍历。省略 `outputs` 时，输出依次为目标与每个导数；`inputs` 中填写运行时变量值。
+- JSON 文件最大 16 MiB；重复键、表达式重名、未定义引用、循环依赖及错误算子参数个数会报错。
+
+### 先加载自定义算子
+
+插件实现 `CustomOp` 的 `forward`、`backward`、`symbolic_partial`，并导出函数：
+
+```cpp
+extern "C" void register_autodiff_ops(autodiff::CustomOpRegistry& registry) {
+    registry.register_op("cube_plus_2x", std::make_shared<CubePlus2X>());
+}
+```
+
+启动时传 `--op_plugins=./libexample_custom_ops.so`；多个插件路径以逗号分隔。动态库由 `PluginManager` 加载，并在**读取 JSON 前**完成注册。插件与主程序须使用兼容的 C++ 编译器、ABI 和本框架动态库。运行中的算子对象须无副作用、线程安全。
+
+插件加载和 `mkdir` 使用 POSIX 接口（Linux/macOS）；Windows 需要替换这两处平台实现。
+
+### DOT 微分解释
+
+`--emit_dot=true` 会写 `dot/target.dot`（原目标依赖）与 `dot/derivative_1_grad_p.dot` 等（每个导数一个文件）。微分 DOT 中灰色节点来自求导前的图，蓝色节点是本轮求导新建的表达式，橙色是求导来源，绿色是求导目标变量，紫色是导数结果；浅黄色便笺解释每一步的 `dz × 局部导数`、输入与贡献节点，紫色便笺显示导数标题及公式。只保留与本次 `wrt` 相关的传播步骤。DOT 为文本，可用 `dot -Tsvg dot/derivative_1_grad_p.dot -o grad_p.svg` 渲染；渲染需要另装 Graphviz。
+
+`examples/dot_preview/` 内附基于 `examples/model.json` 的预览 DOT 文件，便于直接查看输出格式。它们是示例资源；运行时生成新文件仍完全由 `--emit_dot` 控制。
 
 ## 图中样例
 
@@ -83,6 +150,6 @@ evaluator.backward(0, inputs, wrts, grads, ws); // 根 0 为 loss
 
 ## 调试与边界约定
 
-`expr.named("label")` 为节点命名；`expr.explain()` 展示有深度上限的表达式；`graph.dump_dot(expr, stream)` 导出依赖图。示例程序在运行目录生成 `loss.dot`，可运行 `dot -Tsvg loss.dot -o loss.svg` 渲染。
+`expr.named("label")` 为节点命名；`expr.explain()` 展示有深度上限的表达式；C++ API 仍可主动调用 `graph.dump_dot(expr, stream)` 导出依赖图。命令行程序仅在 `--emit_dot=true` 时生成 DOT 文件。
 
 `abs(0)` 使用导数 0 的约定。内部 `sign` 节点的导数按几乎处处为 0 处理，因此该点显示的二阶导也为 0，**并非 0 点的经典数学二阶导**。除以零及 `exp` 溢出遵循 `double` 的 IEEE 754 结果。有限代数化简（如 `x + 0 -> x`）不保证完全保持有符号零的 IEEE 754 细节。常量折叠和代数化简不会额外删除 `x * 0`，避免吞掉 `NaN`。请避免在算子不可导点、溢出点依赖数值梯度与符号梯度严格一致。

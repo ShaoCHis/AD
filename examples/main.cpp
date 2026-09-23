@@ -1,7 +1,6 @@
 #include "autodiff/autodiff.h"
 
 #include <array>
-#include <fstream>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -66,8 +65,6 @@ int main() {
     std::cout << "direct backward: dp=" << numeric_grads[0]
               << ", dpred=" << numeric_grads[1] << '\n';
 
-    std::ofstream graph_file("loss.dot");
-    graph.dump_dot(loss, graph_file);
     std::cout << "d(loss)/dp: " << grad_p.explain() << '\n';
 
     auto cube = graph.custom(std::make_shared<CubePlus2X>(), {p});
