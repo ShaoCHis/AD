@@ -1,12 +1,12 @@
 # Scalar Autodiff（C++11）
 
-按照 **generator → evaluator → post-evaluator** 三个执行阶段组织标量静态计算图。generator 根据简洁 JSON 或赋值表达式构图并加载自定义算子；evaluator 对任意命名节点取值或求导；post-evaluator 根据开关输出解释性 DOT、用二阶精度中心差分检查导数。
+按照 **generator → evaluator → post-evaluator** 三个执行阶段组织标量静态计算图。generator 在进程中只初始化一次，根据简洁 JSON 或赋值表达式构图并加载自定义算子；evaluator 可在多个线程中对任意命名节点取值或求导；post-evaluator 根据开关输出解释性 DOT、用二阶精度中心差分检查导数。
 
 | 模块 | 头文件 / 实现 | 职责 |
 | --- | --- | --- |
 | 图内核 | `graph.h` / `graph.cpp` | 节点、算术、插件节点、符号求导、DOT 图底层操作 |
-| generator | `generator.h` / `generator.cpp` | 加载配置和插件、解析赋值表达式、保存名字到节点的映射 |
-| evaluator | `evaluator.h` / `evaluator.cpp` | 编译所选查询、执行数值计算与数值反传；提供中间节点扰动接口 |
+| generator | `generator.h` / `generator.cpp` | 单例加载配置和插件、保存名称映射；加锁编译并缓存不同的求导计划 |
+| evaluator | `evaluator.h` / `evaluator.cpp` | 执行只读查询计划、数值计算与数值反传；提供中间节点扰动接口 |
 | post-evaluator | `post_evaluator.h` / `post_evaluator.cpp` | 按开关输出 DOT 和校验导数；无开关时没有额外处理 |
 | CLI | `runner/main.cpp`、`runner/post_evaluator_flags.cpp` | 用 gflags 读取配置、输入和查询；post-evaluator 的 gflags 开关集中在后处理适配文件 |
 
@@ -58,19 +58,19 @@ post-evaluator 的开关彼此独立：
 
 中心差分使用 `(f(v+h)-f(v-h))/(2h)`，截断误差阶为 `O(h²)`；这里的“二阶”指**一阶导数的二阶精度数值近似**。对中间节点 `h`，程序将其数值视为独立输入，仅重算依赖它的下游节点，因此验证的是 `d(t)/d(h)` 的图上偏导数。若数学函数在当前点不可导（如某些 `abs` 的尖点）、数值溢出或步长无法表示，校验可能失败或报告原因。校验自定义算子时，会通过其 `forward()` 重算，并与 `symbolic_partial()` 生成的导数比较。
 
-DOT 文件包含原图节点、求导新增节点、传播路径和局部导数说明。可运行 `dot -Tsvg dot/query_4_d_t__d_x_.dot -o grad.svg` 渲染；`examples/dot_preview/` 提供文本预览，渲染需要 Graphviz。导数过程必须在编译求导查询前开启记录：C++ 代码先调用 `post.prepare(program.graph())`，再构造 `Evaluator`。
+DOT 文件包含原图节点、求导新增节点、传播路径和局部导数说明。可运行 `dot -Tsvg dot/query_4_d_t__d_x_.dot -o grad.svg` 渲染；`examples/dot_preview/` 提供文本预览，渲染需要 Graphviz。编译查询时将 `post.emits_dot()` 传给 `generator.compile(...)`，generator 会在同一把锁内开启并记录求导过程；DOT 读取也在锁内进行。
 
 ### 在 examples 目录用 g++ 编译
 
 ```bash
 cd examples
-g++ -std=c++11 -O2 -fPIC -shared -I../include \
+g++ -std=c++11 -O2 -pthread -fPIC -shared -I../include \
   ../src/graph.cpp ../src/evaluator.cpp ../src/generator.cpp ../src/post_evaluator.cpp \
   -ldl -o libscalar_autodiff.so
-g++ -std=c++11 -O2 -fPIC -shared -I../include \
+g++ -std=c++11 -O2 -pthread -fPIC -shared -I../include \
   custom_ops.cpp -L. -lscalar_autodiff \
   -Wl,-rpath,'$ORIGIN' -o libexample_custom_ops.so
-g++ -std=c++11 -O2 -I../include ../runner/main.cpp ../runner/post_evaluator_flags.cpp -L. \
+g++ -std=c++11 -O2 -pthread -I../include ../runner/main.cpp ../runner/post_evaluator_flags.cpp -L. \
   -lscalar_autodiff -lgflags -ldl -Wl,-rpath,'$ORIGIN' -o autodiff_runner
 ./autodiff_runner --expr_file=model.expr --op_plugins=./libexample_custom_ops.so \
   --inputs=x=1,y=2 --outputs=h,z,t --derivatives=t:x,t:h \
@@ -87,30 +87,48 @@ using namespace autodiff;
 
 GeneratorConfig config = read_generator_json("examples/model.json");
 config.op_plugins.push_back("./build/libexample_custom_ops.so");
-GraphGenerator generator(config); // 插件先加载，再建立静态图
-ExpressionProgram& program = generator.program();
+GraphGenerator& generator = GraphGenerator::initialize(config); // 初始化一次
+const ExpressionProgram& program = generator.program();
 
 PostEvaluationOptions options;
 options.verify_derivatives = true;
 options.emit_dot = true;
 PostEvaluator post(options);
-post.prepare(program.graph());  // 必须在符号求导前
 
 Expr t = program.at("t");
 Expr h = program.at("h");
 NamedQuery request{EvaluationQuery::derivative(t, h), "d(t)/d(h)", "t", "h"};
-Evaluator evaluator({request.request});
+std::shared_ptr<const Evaluator> evaluator =
+    generator.compile({request.request}, post.emits_dot());
 std::map<std::string, double> values{{"x", 1}, {"y", 2}};
-Inputs inputs = program.make_inputs(evaluator, values);
-Workspace workspace = evaluator.create_workspace();
+Inputs inputs = program.make_inputs(*evaluator, values);
+Workspace workspace = evaluator->create_workspace();
 double result[1];
-evaluator.evaluate(inputs, Span<double>(result, 1), workspace);
-std::vector<DerivativeCheck> checks = post.run(program, evaluator,
+evaluator->evaluate(inputs, Span<double>(result, 1), workspace);
+std::vector<DerivativeCheck> checks = post.run(generator, *evaluator,
     Span<const NamedQuery>(&request, 1), values, Span<const double>(result, 1));
 // result[0] == 1，checks[0].passed == true
 ```
 
-`GraphGenerator` 持有插件代码、注册表和静态图，必须比 `Evaluator` 活得久。改变查询后重建 `Evaluator`；只改变输入值时复用其编译计划与工作区。每个线程使用单独的输入及工作区。
+`GraphGenerator::instance()` 在首次 `initialize(config)` 后取回同一对象；重复传入相同配置返回同一对象，不同配置报错。单例在进程结束前保留图和插件代码。`compile()` 按请求缓存计划；第一次编译新的求导请求会向图追加节点，因此 generator 加锁执行。已编译的 `shared_ptr<const Evaluator>` 是只读的，可供多个线程复用。每个线程分别创建自己的 `Inputs` 和 `Workspace`，并传入自己的变量值；不要跨线程共用这两个可变对象。单例返回的 `program()` 仅供查询名称，不在并发阶段直接修改 `Graph`。DOT 生成与新查询的编译使用同一把锁。自定义算子的 `forward()` / `backward()` / `symbolic_partial()` 应保证线程安全。
+
+例如，将上面的只读 `evaluator` 共享给不同线程时，每个任务自行准备工作区：
+
+```cpp
+auto evaluate_one = [&](double x_value) {
+    Inputs local_inputs = program.make_inputs(*evaluator, {{"x", x_value}, {"y", 2}});
+    Workspace local_workspace = evaluator->create_workspace();
+    double local_result[1];
+    evaluator->evaluate(local_inputs, Span<double>(local_result, 1), local_workspace);
+    return local_result[0];
+};
+std::thread a([&] { double first = evaluate_one(1); /* 使用 first */ });
+std::thread b([&] { double second = evaluate_one(2); /* 使用 second */ });
+a.join();
+b.join();
+```
+
+此段代码还需在调用方包含 `<thread>`。`tests/test_concurrency.cpp` 会让 8 个线程同时请求导数、取值并读取 DOT，检查这些操作的结果。
 
 ## 定义插件算子
 

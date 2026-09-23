@@ -212,7 +212,11 @@ std::vector<double> Evaluator::evaluate(
 void Evaluator::backward(std::size_t root_index, const Inputs& in,
                          Span<const Expr> wrts, Span<double> out, Workspace& ws) const {
     if (root_index >= roots_.size() || out.size() != wrts.size()) fail("invalid gradient request");
-    for (Expr x : wrts) graph_->validate(x);
+    // Validate against this plan's immutable snapshot. Reading Graph::nodes_
+    // here would race another thread compiling a new derivative on the graph.
+    for (Expr x : wrts)
+        if (&x.graph() != graph_ || x.id() >= index_by_node_.size())
+            fail("gradient node is not in evaluator snapshot");
     check(in, ws);
     run(in, ws);
     std::fill(ws.adjoints_.begin(), ws.adjoints_.end(), 0.0);

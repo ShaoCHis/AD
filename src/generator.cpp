@@ -412,7 +412,18 @@ GeneratorConfig read_generator_json(const std::string& path) {
     return ConfigJsonReader(read_expression_file(path)).parse();
 }
 
-GraphGenerator::GraphGenerator(const GeneratorConfig& config) {
+namespace {
+std::mutex& singleton_mutex() {
+    static std::mutex guard;
+    return guard;
+}
+GraphGenerator*& singleton_storage() {
+    static GraphGenerator* generator = nullptr;
+    return generator;
+}
+} // namespace
+
+GraphGenerator::GraphGenerator(const GeneratorConfig& config) : config_(config) {
     if (config.expressions.empty()) throw std::invalid_argument("generator needs assignments");
     for (const std::string& path : config.op_plugins) plugins_.load(path, registry_);
     std::string source;
@@ -421,6 +432,66 @@ GraphGenerator::GraphGenerator(const GeneratorConfig& config) {
         source += '\n';
     }
     program_.reset(new ExpressionProgram(source, registry_));
+}
+
+GraphGenerator& GraphGenerator::initialize(const GeneratorConfig& config) {
+    std::lock_guard<std::mutex> guard(singleton_mutex());
+    GraphGenerator*& singleton = singleton_storage();
+    if (!singleton) singleton = new GraphGenerator(config);
+    else if (singleton->config_.expressions != config.expressions ||
+             singleton->config_.op_plugins != config.op_plugins)
+        throw std::invalid_argument("static graph is already initialized with different configuration");
+    // Intentionally process-lifetime: evaluators and plugin code remain valid
+    // even during shutdown and across threads.
+    return *singleton;
+}
+
+GraphGenerator& GraphGenerator::instance() {
+    std::lock_guard<std::mutex> guard(singleton_mutex());
+    GraphGenerator* singleton = singleton_storage();
+    if (!singleton) throw std::logic_error("initialize the static graph first");
+    return *singleton;
+}
+
+std::shared_ptr<const Evaluator> GraphGenerator::compile(
+    const std::vector<EvaluationQuery>& queries, bool explain_dot) {
+    if (queries.empty()) throw std::invalid_argument("select at least one query");
+    std::lock_guard<std::mutex> guard(graph_mutex_);
+    std::string key = explain_dot ? "explain:" : "plain:";
+    for (const EvaluationQuery& query : queries) {
+        if (&query.output.graph() != &program_->graph() ||
+            (query.kind == EvaluationQuery::Derivative &&
+             &query.root.graph() != &program_->graph()))
+            throw std::invalid_argument("query belongs to another static graph");
+        if (query.kind != EvaluationQuery::Value && query.kind != EvaluationQuery::Derivative)
+            throw std::invalid_argument("invalid query kind");
+        key += std::to_string(query.kind);
+        key += ':';
+        key += std::to_string(query.kind == EvaluationQuery::Value ? 0 : query.root.id());
+        key += ':';
+        key += std::to_string(query.output.id());
+        key += ';';
+    }
+    auto existing = plans_.find(key);
+    if (existing != plans_.end()) return existing->second;
+    // Evaluator construction may append symbolic derivative nodes. Keeping
+    // this region locked prevents another compilation or DOT read racing it.
+    program_->graph().enable_derivative_explanations(explain_dot);
+    std::shared_ptr<const Evaluator> plan(new Evaluator(queries));
+    plans_.insert(std::make_pair(key, plan));
+    return plan;
+}
+
+void GraphGenerator::dump_dot(Expr node, std::ostream& out) const {
+    std::lock_guard<std::mutex> guard(graph_mutex_);
+    program_->graph().dump_dot(node, out);
+}
+void GraphGenerator::dump_derivative_dot(Expr root, Expr output, Expr derivative,
+                                         std::ostream& out, const std::string& root_name,
+                                         const std::string& output_name) const {
+    std::lock_guard<std::mutex> guard(graph_mutex_);
+    program_->graph().dump_derivative_dot(root, output, derivative, out,
+                                          root_name, output_name);
 }
 
 } // namespace autodiff

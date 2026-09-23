@@ -35,22 +35,22 @@ struct DerivativeCheck {
     std::string reason;
 };
 
-// Post-processing is optional. prepare() must precede symbolic differentiation
-// because DOT explanations capture the propagation rules when created.
+// Pass emits_dot() to GraphGenerator::compile so explanations are recorded
+// atomically with the derivative plan, even under concurrent requests.
 class PostEvaluator {
 public:
     explicit PostEvaluator(const PostEvaluationOptions& options);
-    void prepare(Graph& graph) const;
-    std::vector<DerivativeCheck> run(ExpressionProgram& program,
+    bool emits_dot() const { return options_.emit_dot; }
+    std::vector<DerivativeCheck> run(GraphGenerator& generator,
                                      const Evaluator& evaluator,
                                      Span<const NamedQuery> queries,
                                      const std::map<std::string, double>& input_values,
                                      Span<const double> results) const;
 private:
     PostEvaluationOptions options_;
-    void write_dot(ExpressionProgram& program, const Evaluator& evaluator,
+    void write_dot(GraphGenerator& generator, const Evaluator& evaluator,
                    Span<const NamedQuery> queries) const;
-    DerivativeCheck verify(ExpressionProgram& program, const NamedQuery& query,
+    DerivativeCheck verify(GraphGenerator& generator, const NamedQuery& query,
                            double analytic,
                            const std::map<std::string, double>& input_values) const;
 };

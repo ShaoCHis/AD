@@ -4,6 +4,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -83,16 +84,31 @@ GeneratorConfig read_generator_json(const std::string& path);
 
 class GraphGenerator {
 public:
-    explicit GraphGenerator(const GeneratorConfig& config);
+    // Exactly one graph is loaded per process. Repeated initialization with
+    // identical config returns the same object; different config is rejected.
+    static GraphGenerator& initialize(const GeneratorConfig& config);
+    static GraphGenerator& instance();
     GraphGenerator(const GraphGenerator&) = delete;
     GraphGenerator& operator=(const GraphGenerator&) = delete;
-    ExpressionProgram& program() { return *program_; }
+    // Expose only read-only symbols; graph mutations go through compile().
     const ExpressionProgram& program() const { return *program_; }
+    // Concurrent calls are serialized while symbolic derivative nodes are
+    // added. The returned immutable plan can execute on any number of threads.
+    std::shared_ptr<const Evaluator> compile(const std::vector<EvaluationQuery>& queries,
+                                              bool explain_dot = false);
+    void dump_dot(Expr node, std::ostream& out) const;
+    void dump_derivative_dot(Expr root, Expr output, Expr derivative,
+                             std::ostream& out, const std::string& root_name,
+                             const std::string& output_name) const;
 private:
+    explicit GraphGenerator(const GeneratorConfig& config);
+    GeneratorConfig config_;
     // Destruction is in reverse order: graph, registry, loaded plugin code.
     PluginManager plugins_;
     CustomOpRegistry registry_;
     std::unique_ptr<ExpressionProgram> program_;
+    mutable std::mutex graph_mutex_;
+    std::map<std::string, std::shared_ptr<const Evaluator>> plans_;
 };
 
 } // namespace autodiff

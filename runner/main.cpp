@@ -70,11 +70,10 @@ int main(int argc, char** argv) {
         else config.expressions.push_back(autodiff::read_expression_file(FLAGS_expr_file));
         std::vector<std::string> extra = split(FLAGS_op_plugins, ',');
         config.op_plugins.insert(config.op_plugins.end(), extra.begin(), extra.end());
-        autodiff::GraphGenerator generator(config);
-        autodiff::ExpressionProgram& program = generator.program();
+        autodiff::GraphGenerator& generator = autodiff::GraphGenerator::initialize(config);
+        const autodiff::ExpressionProgram& program = generator.program();
 
         autodiff::PostEvaluator post(autodiff::post_options_from_flags());
-        post.prepare(program.graph()); // trace recording must precede derivatives
 
         // Phase 2: every query selects its own node(s); there is no target.
         std::vector<autodiff::NamedQuery> selections;
@@ -94,17 +93,17 @@ int main(int argc, char** argv) {
         if (selections.empty()) throw std::invalid_argument("select --outputs and/or --derivatives");
         std::vector<autodiff::EvaluationQuery> queries;
         for (const autodiff::NamedQuery& item : selections) queries.push_back(item.request);
-        autodiff::Evaluator evaluator(queries);
+        std::shared_ptr<const autodiff::Evaluator> evaluator = generator.compile(queries, post.emits_dot());
         std::map<std::string, double> values = parse_inputs(FLAGS_inputs);
-        autodiff::Inputs inputs = program.make_inputs(evaluator, values);
-        autodiff::Workspace workspace = evaluator.create_workspace();
+        autodiff::Inputs inputs = program.make_inputs(*evaluator, values);
+        autodiff::Workspace workspace = evaluator->create_workspace();
         std::vector<double> results(selections.size());
-        evaluator.evaluate(inputs, results, workspace);
+        evaluator->evaluate(inputs, results, workspace);
         for (std::size_t i = 0; i < selections.size(); ++i)
             std::cout << selections[i].label << " = " << std::setprecision(15) << results[i] << '\n';
 
         // Phase 3: DOT and numerical checks are independent optional actions.
-        std::vector<autodiff::DerivativeCheck> checks = post.run(program, evaluator,
+        std::vector<autodiff::DerivativeCheck> checks = post.run(generator, *evaluator,
             selections, values, results);
         bool failed = false;
         for (const autodiff::DerivativeCheck& item : checks) {
