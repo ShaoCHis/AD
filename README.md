@@ -1,24 +1,38 @@
 # Scalar Autodiff（C++11）
 
-使用逐行赋值表达式构造静态计算图，按需查询任意已命名节点的数值及任意两个节点间的导数。表达式支持自定义算子，命令行使用 gflags，求导步骤可按需导出 DOT。手动使用 C++ `Graph` API 的示例仍在 `examples/main.cpp`。
+按照 **generator → evaluator → post-evaluator** 三个执行阶段组织标量静态计算图。generator 根据简洁 JSON 或赋值表达式构图并加载自定义算子；evaluator 对任意命名节点取值或求导；post-evaluator 根据开关输出解释性 DOT、用二阶精度中心差分检查导数。
 
-## 表达式文件
+| 模块 | 头文件 / 实现 | 职责 |
+| --- | --- | --- |
+| 图内核 | `graph.h` / `graph.cpp` | 节点、算术、插件节点、符号求导、DOT 图底层操作 |
+| generator | `generator.h` / `generator.cpp` | 加载配置和插件、解析赋值表达式、保存名字到节点的映射 |
+| evaluator | `evaluator.h` / `evaluator.cpp` | 编译所选查询、执行数值计算与数值反传；提供中间节点扰动接口 |
+| post-evaluator | `post_evaluator.h` / `post_evaluator.cpp` | 按开关输出 DOT 和校验导数；无开关时没有额外处理 |
+| CLI | `runner/main.cpp`、`runner/post_evaluator_flags.cpp` | 用 gflags 读取配置、输入和查询；post-evaluator 的 gflags 开关集中在后处理适配文件 |
 
-`examples/model.expr`：
+旧的 `autodiff.h` 和 `model.h` 保留为转发头文件，兼容已有示例的 `#include`。
 
-```text
-h = x + y
-z = 2*x + exp(x)
-t = h - z + func_a(x,y)
+## 定义静态图
+
+`examples/model.json` 只描述**如何建图**：
+
+```json
+{
+  "expressions": [
+    "h = x + y",
+    "z = 2*x + exp(x)",
+    "t = h - z + func_a(x,y)"
+  ]
+}
 ```
 
-每行一个赋值；空行和 `#` 后的行内注释会被忽略。未被赋值但出现在右侧的名字（这里的 `x`、`y`）自动成为输入变量；赋值后的名字保存在 `ExpressionProgram::symbols()` 映射中，可通过 `at("h")` 等方式获取节点。定义允许先引用后赋值，解析后检查循环定义和重名。没有固定的 `target`；`h`、`z`、`t` 和 `x` 均可单独查询。
+可选 `"op_plugins": ["./build/libexample_custom_ops.so"]`，样例见 `examples/model_with_plugin.json`。generator 在解析赋值表达式前加载插件。配置只接收 `expressions`（至少一项）和 `op_plugins`（可选）两个字符串数组；未知键和错误 JSON 会报错。插件路径相对于**运行时工作目录**。也可以直接通过 `--expr_file=examples/model.expr` 加载同样的逐行赋值文本，并用 `--op_plugins` 添加插件；两种图输入方式恰好选择一种。
 
-支持括号、数值常量（含小数和科学记数法）、一元正负号，以及按通常优先级计算的 `+ - * /`。函数写作 `exp(x)`、`abs(x)`、`square(x)`，已注册自定义算子写作 `func_a(x,y)`。函数调用必须使用准确的参数个数；未知函数、错误参数个数、错误语法均会在建图时报告。`examples/simple.expr` 展示了无插件的 `t = h - z + x`。
+表达式支持 `+ - * /`、括号、一元正负号、数值、`exp(x)`、`abs(x)`、`square(x)` 和已注册算子 `func_a(x,y)`。函数参数个数、重名、循环定义和语法错误在建图时检查。未在左侧赋值的标识符自动成为输入变量。赋值允许前向引用；所有名称，包括 `h`、`z`、`t`、`x`、`y`，均可通过 `ExpressionProgram::at(name)` 和 `symbols()` 映射查询。没有固定 target。
 
-## 构建和运行
+## 使用 gflags 运行
 
-需要支持 C++11 的编译器；命令行程序需要 gflags 开发库与 CMake 配置；插件动态加载使用 POSIX 接口（Linux/macOS）。在项目根目录：
+需安装 C++11 编译器与 gflags 开发包；CMake 构建：
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -26,82 +40,78 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 
 ./build/autodiff_runner \
-  --expr_file=examples/model.expr \
+  --config_json=examples/model.json \
   --op_plugins=./build/libexample_custom_ops.so \
   --inputs=x=1,y=2 \
   --outputs=h,z,t \
   --derivatives=t:x,t:h,z:x \
+  --verify_derivatives=true \
   --emit_dot=true --dot_dir=dot
 ```
 
-这里 `--outputs` 是要取值的节点名，`--derivatives=root:output` 请求 `d(root)/d(output)`。上例分别得到 `h`、`z`、`t` 的数值与 `d(t)/d(x)`、`d(t)/d(h)`、`d(z)/d(x)`；不指定两类查询中的任何一种会报错。只想取某个中间结果，可仅传 `--outputs=h`。只查询导数，可仅传 `--derivatives=h:y`。`--inputs` 要提供所选查询实际依赖的变量；查询 `h` 时不用为其余不相关变量赋值。要使用无插件的示例，省略 `--op_plugins` 并传 `--expr_file=examples/simple.expr`。
+`--outputs=h,z` 查询节点值；`--derivatives=t:x,t:h` 分别查询 `d(t)/d(x)` 和 `d(t)/d(h)`，因此任意中间环节都能充当求导起点或终点。至少指定一类查询。`--inputs` 为请求所需变量提供数值；开启数值验证时，还需提供原表达式及被扰动节点所依赖的输入。也可使用 `--config_json=examples/model_with_plugin.json`，并省略命令行的 `--op_plugins`；仅含内置算子时使用 `--expr_file=examples/simple.expr`。
 
-`--emit_dot` 默认为 `false`；设为 `true` 才会在 `--dot_dir` 指定的目录写文件。目录必须已存在或可由程序直接创建。DOT 文本可用 Graphviz 渲染，例如 `dot -Tsvg dot/query_4_d_t__d_x_.dot -o grad.svg`。
+post-evaluator 的开关彼此独立：
 
-如从 `examples` 目录运行，以下命令在项目文件结构下直接编译（需要已安装 gflags）：
+- `--emit_dot=true`：为选中的每项输出一个 `query_*.dot`；默认为 `false`，`--dot_dir=dot` 指定目录。
+- `--verify_derivatives=true`：对每个导数做中心差分校验；默认为 `false`。`--fd_step=1e-5` 设置相对于被扰动节点数值的步长，`--fd_abs_tol=1e-6` 与 `--fd_rel_tol=1e-4` 设置误差限。输出 PASS / FAIL；有失败时进程退出码为 2。
+
+中心差分使用 `(f(v+h)-f(v-h))/(2h)`，截断误差阶为 `O(h²)`；这里的“二阶”指**一阶导数的二阶精度数值近似**。对中间节点 `h`，程序将其数值视为独立输入，仅重算依赖它的下游节点，因此验证的是 `d(t)/d(h)` 的图上偏导数。若数学函数在当前点不可导（如某些 `abs` 的尖点）、数值溢出或步长无法表示，校验可能失败或报告原因。校验自定义算子时，会通过其 `forward()` 重算，并与 `symbolic_partial()` 生成的导数比较。
+
+DOT 文件包含原图节点、求导新增节点、传播路径和局部导数说明。可运行 `dot -Tsvg dot/query_4_d_t__d_x_.dot -o grad.svg` 渲染；`examples/dot_preview/` 提供文本预览，渲染需要 Graphviz。导数过程必须在编译求导查询前开启记录：C++ 代码先调用 `post.prepare(program.graph())`，再构造 `Evaluator`。
+
+### 在 examples 目录用 g++ 编译
 
 ```bash
+cd examples
 g++ -std=c++11 -O2 -fPIC -shared -I../include \
-  ../src/autodiff.cpp ../src/model.cpp -ldl -o libscalar_autodiff.so
+  ../src/graph.cpp ../src/evaluator.cpp ../src/generator.cpp ../src/post_evaluator.cpp \
+  -ldl -o libscalar_autodiff.so
 g++ -std=c++11 -O2 -fPIC -shared -I../include \
   custom_ops.cpp -L. -lscalar_autodiff \
   -Wl,-rpath,'$ORIGIN' -o libexample_custom_ops.so
-g++ -std=c++11 -O2 -I../include ../runner/main.cpp -L. \
+g++ -std=c++11 -O2 -I../include ../runner/main.cpp ../runner/post_evaluator_flags.cpp -L. \
   -lscalar_autodiff -lgflags -ldl -Wl,-rpath,'$ORIGIN' -o autodiff_runner
 ./autodiff_runner --expr_file=model.expr --op_plugins=./libexample_custom_ops.so \
-  --inputs=x=1,y=2 --outputs=h,z,t --derivatives=t:x,t:h
+  --inputs=x=1,y=2 --outputs=h,z,t --derivatives=t:x,t:h \
+  --verify_derivatives=true
 ```
 
-无需 gflags 也可以编译内核测试和原始 C++ 示例：
+`examples/main.cpp` 是直接使用 C++ 手动建图的基础样例；仅需编译 `src/graph.cpp src/evaluator.cpp`，无需 gflags。
 
-```bash
-g++ -std=c++11 -O2 -Iinclude src/autodiff.cpp tests/test_autodiff.cpp -o autodiff_tests
-./autodiff_tests
-g++ -std=c++11 -O2 -Iinclude src/autodiff.cpp examples/main.cpp -o autodiff_example
-./autodiff_example
-```
-
-## 在 C++ 中查询节点
+## 嵌入 C++ 项目
 
 ```cpp
-#include "autodiff/model.h"
-#include <vector>
-
+#include "autodiff/post_evaluator.h"
 using namespace autodiff;
-CustomOpRegistry registry;
-PluginManager plugins;
-plugins.load("./libexample_custom_ops.so", registry); // 在程序建图前注册
-ExpressionProgram program(read_expression_file("examples/model.expr"), registry);
 
-Expr h = program.at("h");
+GeneratorConfig config = read_generator_json("examples/model.json");
+config.op_plugins.push_back("./build/libexample_custom_ops.so");
+GraphGenerator generator(config); // 插件先加载，再建立静态图
+ExpressionProgram& program = generator.program();
+
+PostEvaluationOptions options;
+options.verify_derivatives = true;
+options.emit_dot = true;
+PostEvaluator post(options);
+post.prepare(program.graph());  // 必须在符号求导前
+
 Expr t = program.at("t");
-Expr x = program.at("x");
-std::vector<EvaluationQuery> queries;
-queries.push_back(EvaluationQuery::value(h));
-queries.push_back(EvaluationQuery::derivative(t, x)); // d(t)/d(x)
-Evaluator evaluator(queries);
-Inputs inputs = program.make_inputs(evaluator, {{"x", 1.0}, {"y", 2.0}});
+Expr h = program.at("h");
+NamedQuery request{EvaluationQuery::derivative(t, h), "d(t)/d(h)", "t", "h"};
+Evaluator evaluator({request.request});
+std::map<std::string, double> values{{"x", 1}, {"y", 2}};
+Inputs inputs = program.make_inputs(evaluator, values);
 Workspace workspace = evaluator.create_workspace();
-std::vector<double> results(queries.size());
-evaluator.evaluate(inputs, results, workspace);
-// results[0] = h，results[1] = d(t)/d(x)
+double result[1];
+evaluator.evaluate(inputs, Span<double>(result, 1), workspace);
+std::vector<DerivativeCheck> checks = post.run(program, evaluator,
+    Span<const NamedQuery>(&request, 1), values, Span<const double>(result, 1));
+// result[0] == 1，checks[0].passed == true
 ```
 
-`EvaluationQuery::value(output)` 查询节点数值，`EvaluationQuery::derivative(root, output)` 查询 `d(root)/d(output)`。`Evaluator` 只编译所选查询的依赖，在一个计划中计算多个请求；同一 `root` 的符号求导请求合并求解。改变查询时重新构造 `Evaluator`；更换输入数值时复用它和 `Workspace`。`Graph`/`ExpressionProgram` 的生命周期必须覆盖执行器，`PluginManager` 必须比使用插件的对象活得更久。每个线程使用自己的输入和工作区，才能并发使用只读执行器。
+`GraphGenerator` 持有插件代码、注册表和静态图，必须比 `Evaluator` 活得久。改变查询后重建 `Evaluator`；只改变输入值时复用其编译计划与工作区。每个线程使用单独的输入及工作区。
 
-## 自定义算子
+## 定义插件算子
 
-`examples/custom_ops.cpp` 实现了二元 `func_a(a,b)=a*b+a`。算子继承 `CustomOp` 并实现以下方法：
-
-- `name()`：显示在 DOT 中的名称；`arity()`：规定函数参数个数；
-- `forward(inputs)`：计算结果；
-- `backward(inputs, output, output_grad, input_grads)`：把各输入的数值梯度累加进 `input_grads`；
-- `symbolic_partial(graph, inputs, output, input_index)`：生成相应输入的局部导数表达式，用于解释图和高阶微分。
-
-插件导出 `extern "C" void register_autodiff_ops(autodiff::CustomOpRegistry&)`，以 `registry.register_op("func_a", std::make_shared<FuncA>())` 注册；`--op_plugins` 可以是逗号分隔的多个 `.so` 路径。插件先于表达式加载。新增的 `arity()` 为必需接口，旧插件须按新版头文件重新编译；插件和主程序必须使用兼容的 ABI。自定义算子应是无副作用且线程安全的确定性计算。
-
-## DOT 微分解释
-
-`--emit_dot=true` 为每个选中的数值或导数生成一个 `query_序号_查询名.dot`，`examples/dot_preview/` 有本示例的输出。普通数值文件表示节点的表达式依赖；导数文件同时标明原表达式的图、求导过程中的传播、局部导数和最终导数表达式。灰色节点来自原图；蓝色是新建的求导表达式；橙色表示求导起点；绿色表示求导终点；紫色是导数结果。黄色便笺写明每一步的上游梯度乘局部导数及对结果的贡献；紫色便笺标明所求导数。比如 `d(t)/d(x)` 图中 `func_a` 的局部导数来自插件的 `symbolic_partial()`。
-
-`abs(0)` 的导数约定为 0；`sign` 导数按几乎处处为 0 处理。零点的二阶导不是经典数学二阶导。除零和指数溢出遵循 `double` 的结果。语法不包含比较、条件分支或隐式乘法（写 `2*x`）。
+`examples/custom_ops.cpp` 中的 `func_a(a,b)=a*b+a` 实现了 `CustomOp::name()`、`arity()`、`forward()`、`backward()` 和 `symbolic_partial()`；导出 `extern "C" void register_autodiff_ops(CustomOpRegistry&)`。`arity()` 用于在建图时验证 `func_a(x,y)` 是否传入两个参数。插件需要兼容的 C++ ABI；插件加载和 DOT 目录创建使用 POSIX 接口（Linux/macOS）。

@@ -1,0 +1,8 @@
+{
+  "op_plugins": ["./build/libexample_custom_ops.so"],
+  "expressions": [
+    "h = x + y",
+    "z = 2*x + exp(x)",
+    "t = h - z + func_a(x,y)"
+  ]
+}

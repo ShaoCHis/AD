@@ -1,4 +1,4 @@
-#include "autodiff/model.h"
+#include "autodiff/generator.h"
 
 #include <cctype>
 #include <cerrno>
@@ -273,6 +273,154 @@ std::string read_expression_file(const std::string& path) {
         throw std::invalid_argument("expression file must be at most 16 MiB: " + path);
     in.seekg(0, std::ios::beg);
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+namespace {
+// The config intentionally accepts only a small JSON schema: two string arrays.
+// Expressions remain ordinary assignments rather than a verbose node tree.
+class ConfigJsonReader {
+public:
+    explicit ConfigJsonReader(const std::string& source) : text_(source) {}
+    GeneratorConfig parse() {
+        GeneratorConfig config;
+        expect('{');
+        bool expressions_seen = false, plugins_seen = false;
+        if (!take('}')) {
+            do {
+                std::string key = read_string();
+                expect(':');
+                if (key == "expressions") {
+                    if (expressions_seen) error("duplicate expressions key");
+                    expressions_seen = true;
+                    config.expressions = read_array();
+                } else if (key == "op_plugins") {
+                    if (plugins_seen) error("duplicate op_plugins key");
+                    plugins_seen = true;
+                    config.op_plugins = read_array();
+                } else error("unknown config key: " + key);
+            } while (take(','));
+            expect('}');
+        }
+        space();
+        if (pos_ != text_.size()) error("trailing JSON content");
+        if (!expressions_seen || config.expressions.empty()) error("expressions must be a nonempty array");
+        for (const std::string& expression : config.expressions)
+            if (trim(expression).empty()) error("empty assignment");
+        for (const std::string& plugin : config.op_plugins)
+            if (plugin.empty()) error("empty plugin path");
+        return config;
+    }
+private:
+    const std::string& text_;
+    std::size_t pos_ = 0;
+    void space() {
+        while (pos_ < text_.size() && (text_[pos_] == ' ' || text_[pos_] == '\t' ||
+               text_[pos_] == '\n' || text_[pos_] == '\r')) ++pos_;
+    }
+    void error(const std::string& reason) const {
+        throw std::invalid_argument("invalid generator JSON at byte " +
+                                    std::to_string(pos_) + ": " + reason);
+    }
+    bool take(char character) {
+        space();
+        if (pos_ < text_.size() && text_[pos_] == character) { ++pos_; return true; }
+        return false;
+    }
+    void expect(char character) {
+        if (!take(character)) error(std::string("expected '") + character + "'");
+    }
+    // The JSON strings used here are source code or plugin paths. Decode all
+    // standard escapes; reject malformed Unicode instead of silently changing it.
+    unsigned hex4() {
+        if (text_.size() - pos_ < 4) error("incomplete Unicode escape");
+        unsigned value = 0;
+        for (int i = 0; i < 4; ++i) {
+            char c = text_[pos_++];
+            unsigned digit = c >= '0' && c <= '9' ? c - '0' :
+                             c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+                             c >= 'A' && c <= 'F' ? c - 'A' + 10 : 16;
+            if (digit > 15) error("invalid Unicode escape");
+            value = (value << 4) | digit;
+        }
+        return value;
+    }
+    void append_utf8(std::string& out, unsigned codepoint) {
+        if (codepoint < 0x80) out += static_cast<char>(codepoint);
+        else if (codepoint < 0x800) {
+            out += static_cast<char>(0xc0 | (codepoint >> 6));
+            out += static_cast<char>(0x80 | (codepoint & 0x3f));
+        } else if (codepoint < 0x10000) {
+            out += static_cast<char>(0xe0 | (codepoint >> 12));
+            out += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f));
+            out += static_cast<char>(0x80 | (codepoint & 0x3f));
+        } else {
+            out += static_cast<char>(0xf0 | (codepoint >> 18));
+            out += static_cast<char>(0x80 | ((codepoint >> 12) & 0x3f));
+            out += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f));
+            out += static_cast<char>(0x80 | (codepoint & 0x3f));
+        }
+    }
+    std::string read_string() {
+        expect('"');
+        std::string result;
+        while (pos_ < text_.size()) {
+            unsigned char c = static_cast<unsigned char>(text_[pos_++]);
+            if (c == '"') return result;
+            if (c < 0x20) error("control character in string");
+            if (c != '\\') { result += static_cast<char>(c); continue; }
+            if (pos_ >= text_.size()) error("unfinished escape");
+            char escaped = text_[pos_++];
+            switch (escaped) {
+            case '"': case '\\': case '/': result += escaped; break;
+            case 'b': result += '\b'; break;
+            case 'f': result += '\f'; break;
+            case 'n': result += '\n'; break;
+            case 'r': result += '\r'; break;
+            case 't': result += '\t'; break;
+            case 'u': {
+                unsigned cp = hex4();
+                if (cp >= 0xd800 && cp <= 0xdbff) {
+                    if (text_.size() - pos_ < 6 || text_[pos_] != '\\' || text_[pos_ + 1] != 'u')
+                        error("missing low surrogate");
+                    pos_ += 2;
+                    unsigned low = hex4();
+                    if (low < 0xdc00 || low > 0xdfff) error("invalid low surrogate");
+                    cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+                } else if (cp >= 0xdc00 && cp <= 0xdfff) error("unpaired low surrogate");
+                append_utf8(result, cp);
+                break;
+            }
+            default: error("unknown string escape");
+            }
+        }
+        error("unterminated string");
+        return result;
+    }
+    std::vector<std::string> read_array() {
+        std::vector<std::string> result;
+        expect('[');
+        if (!take(']')) {
+            do { result.push_back(read_string()); } while (take(','));
+            expect(']');
+        }
+        return result;
+    }
+};
+} // namespace
+
+GeneratorConfig read_generator_json(const std::string& path) {
+    return ConfigJsonReader(read_expression_file(path)).parse();
+}
+
+GraphGenerator::GraphGenerator(const GeneratorConfig& config) {
+    if (config.expressions.empty()) throw std::invalid_argument("generator needs assignments");
+    for (const std::string& path : config.op_plugins) plugins_.load(path, registry_);
+    std::string source;
+    for (const std::string& assignment : config.expressions) {
+        source += assignment;
+        source += '\n';
+    }
+    program_.reset(new ExpressionProgram(source, registry_));
 }
 
 } // namespace autodiff
